@@ -1,0 +1,305 @@
+#!/usr/bin/env python
+import math
+import rospy
+from random import randint
+from geometry_msgs.msg import Twist, PoseWithCovarianceStamped  # message type for cmd_vel
+from tf.transformations import euler_from_quaternion
+from nav_msgs.msg import Odometry
+from patrollers.srv import ServiceRegistration, ServiceStopSimulation, ServiceStopSimulationResponse, ServiceEscapedBot, ServiceSendBotCoords, ServiceSendBotCoordsResponse
+from std_msgs.msg import String
+from sensor_msgs.msg import LaserScan  # message type for scan
+import patrollers.grid
+from patrollers.astar import a_star
+from patrollers.dist import dist
+from patrollers.choice import weighted_choice
+
+# Counterclockwise, starting from top left door
+doors = [[-14.68, 7.84], [-14.68, 0.81], [-11.5, -10.08], [2.49, -10.08],[7.05, -10.08], [11.48, -10.08], [14.75, 6.92], [10.82, 10.13], [-1.29, 10.17]]
+# Clockwise, starting from top left confined robot
+confined_locations = [[-5.64, 3.53], [5.64, 3.53], [5.64, -3.53], [-5.64, -3.53]]
+
+FREQUENCY = 10
+
+TURN_EPSILON = 1  # Acceptable error
+TURN_KP = 0.15  # Coefficient for turn speed
+FORWARD_EPSILON = 0.15
+LASER_ANGLE_FRONT = 0 # radians
+MIN_THRESHOLD_DISTANCE = 0.1 # m, threshold distance.
+
+DEFAULT_REGISTER_TOPIC = "/register_confined"
+DEFAULT_BEGIN_MOVEMENT_TOPIC = "/begin_movement"
+DEFAULT_CONFINED_ESCAPE_TOPIC = "/confined_escaped"
+DEFAULT_STOP_SIM_TOPIC = "stop_sim"
+DEFAULT_SCAN_TOPIC = 'base_scan'
+REQUEST_LOCATIONS_TOPIC = "/request_bot_locations"
+SEND_LOCATIONS_TOPIC = "send_bot_locations"
+
+IMPOSSIBLE_COORDINATE = -99999.
+
+class Confined:
+	def __init__(self, start_location):
+		self.base_speed = 0.5
+  		self.forward_kp = 0.075 # Error coefficient
+		self.rate = rospy.Rate(FREQUENCY)
+
+		self.x = 0  # X coordinate of the robot
+		self.y = 0  # Y coordinate of the robot
+		self.yaw = 0  # Yaw of the robot
+		self.stop_simulation = False # State of the sim
+  
+		self.updated_position = False
+		self.got_begin_command = False
+		self.escaped = False # Has successfully escaped
+		self._close_obstacle = False
+  
+		self.other_bot_coords = list()
+  
+  		curr_pose_topic = str(rospy.get_namespace()) + "curr_pose"
+		self._begin_sub = rospy.Subscriber(DEFAULT_BEGIN_MOVEMENT_TOPIC, String, self._handle_begin_movement)
+		self._odom_sub = rospy.Subscriber(rospy.get_namespace() + "base_pose_ground_truth", Odometry, self._odometry_callback, queue_size = 1)
+		self._cmd_pub = rospy.Publisher(rospy.get_namespace() + "cmd_vel", Twist, queue_size = 1)
+		self._position_pub = rospy.Publisher(curr_pose_topic, PoseWithCovarianceStamped, queue_size = 1)
+		self._request_coords_pub = rospy.Publisher(REQUEST_LOCATIONS_TOPIC, String, queue_size=1)
+		rospy.Service(rospy.get_namespace() + DEFAULT_STOP_SIM_TOPIC, ServiceStopSimulation, self._handle_stop_simulation)
+  		rospy.Service(rospy.get_namespace() + SEND_LOCATIONS_TOPIC, ServiceSendBotCoords, self._handle_bot_coords_request)
+
+		scan_topic = str(rospy.get_namespace()) + DEFAULT_SCAN_TOPIC
+		self._laser_sub = rospy.Subscriber(scan_topic, LaserScan, self._laser_callback, queue_size=1)
+		rospy.sleep(2)
+  
+		self.grid = patrollers.grid.Grid("/root/catkin_ws/src/patrollers/worlds/grid_data/double_field.grid")
+		self.register_bot()
+
+		self.start_location = confined_locations[start_location]
+  		self.target_door_idx = self.select_door()
+
+		rand_duration = randint(0, 20)
+		while not rospy.is_shutdown():
+			if self.updated_position and self.got_begin_command and not self.stop_simulation:
+				rospy.sleep(rand_duration)
+				if self.updated_position and self.got_begin_command and not self.stop_simulation:
+					self.target_door_idx = self.select_door()
+					self.follow_path(self.find_shortest_path(doors[self.target_door_idx]))
+					self.got_begin_command = False
+			else:
+				rand_duration = randint(0, 20)
+
+			self.rate.sleep()
+
+	def register_bot(self):
+		"""Add bot name to the registry of auctioneer using service."""
+		rospy.wait_for_service(DEFAULT_REGISTER_TOPIC)
+		try:
+			registered_bot = rospy.ServiceProxy(
+				DEFAULT_REGISTER_TOPIC, ServiceRegistration)
+			is_success = registered_bot(str(rospy.get_namespace()))
+			if not is_success.success:
+				self._init_position_pub.publish(self.initpose)
+				rospy.sleep(1)
+				self.register_bot()
+		except rospy.ServiceException as e:
+			pass
+
+	def _handle_begin_movement(self, msg):
+		"""Resume simulation."""
+		received_msg = msg.data
+		if received_msg == "begin":
+			self.got_begin_command = True
+			self.stop_simulation = False
+		
+	def _handle_stop_simulation(self, msg):
+		"""Stop the simulation."""
+		if msg.stopcommand == rospy.get_namespace():
+				self.stop_simulation = True
+				rospy.sleep(2)
+				self.stop_simulation = False
+				self.go_to_start()
+				return ServiceStopSimulationResponse(True)
+		else:
+			if self.escaped:
+				self.go_to_start()
+			else:
+				self.stop_simulation = True
+				self.stop()
+			return ServiceStopSimulationResponse(True)
+
+	def _handle_bot_coords_request(self, msg):
+		"""Get all of the coordinates of robots from security to be used for returning to start coordinate without collision"""
+		if msg.coordinate[0] == IMPOSSIBLE_COORDINATE and msg.coordinate[1] == IMPOSSIBLE_COORDINATE:
+			shortest_path = self.find_shortest_path(self.start_location)
+			while not rospy.is_shutdown() and len(shortest_path) == 1:
+				while not rospy.is_shutdown() and self._close_obstacle:
+					self.turn(0.1)
+				self.move_forward(0.3)
+			self.follow_path(shortest_path)
+		else:
+			self.other_bot_coords.append(msg.coordinate)
+			self.grid.set_grid_value(patrollers.grid.get_node_row(msg.coordinate[1]), patrollers.grid.get_node_col(msg.coordinate[0]), 'W')
+
+	def _laser_callback(self, msg):
+		"""Processing of laser message."""
+        # Access to the index of the measurement in front of the robot.
+        # NOTE: assumption: the one at angle 0 corresponds to the front.
+		i = int((LASER_ANGLE_FRONT - msg.angle_min) / msg.angle_increment)
+		if msg.ranges[i] <= MIN_THRESHOLD_DISTANCE:
+			self._close_obstacle = True
+		else:
+			self._close_obstacle = False
+    
+	def turn(self, angle):
+		"""Function to turn by given angle."""
+		target_angle = angle * 180 / math.pi # Convert to degrees
+		if (target_angle < 0): # Convert to positive
+			target_angle += 360
+		# While there's error
+		while (not rospy.is_shutdown() and not self.stop_simulation and (abs(target_angle - (self.yaw * 180 / math.pi))) > TURN_EPSILON):
+			twist_msg = Twist()
+			err = (target_angle - (self.yaw * 180 / math.pi))
+			if err > 180: # Turn from short way around
+				err = err - 360
+			elif err < -180: # Turn from short way around
+				err = 360 + err
+			twist_msg.angular.z = TURN_KP * err # Turn by the error
+			self._cmd_pub.publish(twist_msg)
+			rospy.sleep(0.2)
+
+	def move_forward(self, distance):
+		"""Function to move_forward for a given distance."""
+		initial_location = [self.x, self.y] # Store the initial location
+		# While the distance from the initial location is not large enough
+		while not rospy.is_shutdown() and not self.stop_simulation and abs(dist(initial_location, [self.x, self.y]) - distance) > FORWARD_EPSILON:
+			while self._close_obstacle: # If there's something in front of us
+				twist_msg = Twist() # Don't go forward
+				twist_msg.angular.z = 1 # Turn
+				self._cmd_pub.publish(twist_msg)
+			twist_msg = Twist()
+			twist_msg.linear.x = self.forward_kp * (distance - dist(initial_location, [self.x, self.y])) + self.base_speed # Go by error plus base speed
+			self._cmd_pub.publish(twist_msg)
+			rospy.sleep(0.2)
+		
+		twist_msg = Twist()
+		twist_msg.linear.x = 0 # Stop at the end
+		self._cmd_pub.publish(twist_msg)
+
+	def go_to_node(self, node):
+		"""Function to move to a node."""
+		angle_to_goal = math.atan2(self.y - patrollers.grid.get_node_y(node[0]), self.x - patrollers.grid.get_node_x(node[1])) # Calculate angle to the goal
+		angle_to_goal += math.pi
+		while angle_to_goal < 0 and not rospy.is_shutdown():
+			angle_to_goal += math.pi * 2
+		angle_to_goal = angle_to_goal % (math.pi * 2)
+		self.turn(angle_to_goal) # Turn by that angle
+		distance_to_goal = dist([self.x, self.y], [patrollers.grid.get_node_x(node[1]), patrollers.grid.get_node_y(node[0])]) # Calculate distance
+		self.move_forward(distance_to_goal) # Go by the calculated distance
+		
+	def _odometry_callback(self, msg):
+		"""Odometry callback"""
+		self.send_position(msg)
+		self.x = msg.pose.pose.position.x  # Update x
+		self.y = msg.pose.pose.position.y  # Update y
+
+		global roll, pitch, yaw
+		orientation_q = msg.pose.pose.orientation
+		orientation_list = [orientation_q.x,orientation_q.y, orientation_q.z, orientation_q.w]
+		(roll, pitch, yaw) = euler_from_quaternion(orientation_list)
+
+		while yaw < 0 and not rospy.is_shutdown(): # Convert it to positive
+			yaw += 2 * math.pi
+
+		self.yaw = yaw  # Update yaw
+		self.updated_position = True # Mark as updated
+
+	def send_position(self, msg):
+		"""Send position to security"""
+		curr_pose = PoseWithCovarianceStamped()      # populated with position and orientation information for use by tf
+		curr_pose.header.stamp = rospy.get_rostime()
+		curr_pose.header.frame_id = str(rospy.get_namespace())
+		curr_pose.pose.pose.position.x = msg.pose.pose.position.x
+		curr_pose.pose.pose.position.y = msg.pose.pose.position.y
+		curr_pose.pose.pose.position.z = msg.pose.pose.position.z
+		curr_pose.pose.pose.orientation.w = msg.pose.pose.orientation.x
+		curr_pose.pose.pose.orientation.x = msg.pose.pose.orientation.y
+		curr_pose.pose.pose.orientation.y = msg.pose.pose.orientation.z
+		curr_pose.pose.pose.orientation.z = msg.pose.pose.orientation.w
+		self.curr_pose = curr_pose
+		self._position_pub.publish(curr_pose)
+	
+	def find_closest_doors(self):
+		"""Find distance to all doors and return sorted by increasing distance."""
+		distances = []
+		for i in range(len(doors)): # For each door
+			distances.append([dist(doors[i], [self.x, self.y]), i]) # Calculate distance and append with index
+		distances.sort()
+		return distances # Return sorted
+
+	def select_door(self):
+		"""Randomly select one of the three closest doors."""
+		top_3 = self.find_closest_doors()[:3] # Get top three
+		sum = top_3[0][0] + top_3[1][0] + top_3[2][0] # Get the sum of their distances
+		# Make a random selection based on distance; closer ones having higher probability
+		return weighted_choice([(top_3[0], sum / top_3[0][0]), (top_3[1], sum / top_3[1][0]), (top_3[2], sum / top_3[2][0])])[1]
+
+	def find_shortest_path(self, coordinates):
+		"""Find the shortest path to coordinate."""
+		shortest_path = a_star(self.grid, 
+				(patrollers.grid.get_node_row(self.y), patrollers.grid.get_node_col(self.x)), 
+				(patrollers.grid.get_node_row(coordinates[1]), patrollers.grid.get_node_col(coordinates[0])))
+		return shortest_path
+
+	def follow_path(self, path):
+		"""Follow the given path."""
+		for node in path:
+			if not self.stop_simulation:
+				self.go_to_node(node)
+
+		# If very close to a door
+		if dist([self.x, self.y], [doors[self.target_door_idx][0], doors[self.target_door_idx][1]]) < .5:
+			self.escaped = True # Mark as escaped
+
+			rospy.wait_for_service(DEFAULT_CONFINED_ESCAPE_TOPIC) # Announce it to security
+			try:
+				escaped_bot = rospy.ServiceProxy(
+					DEFAULT_CONFINED_ESCAPE_TOPIC, ServiceEscapedBot)
+				is_success = escaped_bot(str(rospy.get_namespace()) + "|escape")
+				if not is_success.success:
+					rospy.sleep(1)
+					is_success = escaped_bot(str(rospy.get_namespace()) + "|escape")
+			except rospy.ServiceException as e:
+				pass
+		# When returned, remove the temporary 'wall' designations from the nodes that other robots occupy
+		elif dist([self.x, self.y], [self.start_location[0], self.start_location[1]]) < .5:
+			for bot_coord in self.other_bot_coords:
+				self.grid.set_grid_value(patrollers.grid.get_node_row(bot_coord[1]), patrollers.grid.get_node_col(bot_coord[0]), 'P')
+			self.other_bot_coords = list()
+
+			self.escaped = False # Mark as returned
+			rospy.wait_for_service(DEFAULT_CONFINED_ESCAPE_TOPIC)
+			try:
+				escaped_bot = rospy.ServiceProxy(
+					DEFAULT_CONFINED_ESCAPE_TOPIC, ServiceEscapedBot)
+				is_success = escaped_bot(str(rospy.get_namespace()) + "|returned")
+				if not is_success.success:
+					rospy.sleep(1)
+					is_success = escaped_bot(str(rospy.get_namespace()) + "|returned")
+			except rospy.ServiceException as e:
+				pass
+	
+	def stop(self):
+		"""Stop the robot."""
+		twist_msg = Twist()
+		self._cmd_pub.publish(twist_msg)
+
+	def go_to_start(self):
+		"""Go to the initial point in confinement zone."""
+		# Trigger the sequence by sending a message to security to ensure that no
+		# collisions happen
+		self._request_coords_pub.publish(rospy.get_namespace())
+
+def main():
+	rospy.init_node("confined")
+	rospy.sleep(2)
+
+	Confined(rospy.get_param('~location'))
+
+if __name__ == '__main__':
+	main()

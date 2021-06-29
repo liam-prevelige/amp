@@ -1,0 +1,30 @@
+<!-- More information on ROS launch http://wiki.ros.org/roslaunch/XML -->
+
+<launch>
+  <!-- 
+       Using simulation time means nodes initialized after this
+       will not use the system clock for its ROS clock and 
+       instead wait for simulation ticks. 
+       See http://wiki.ros.org/Clock
+       Note: set to false for deploying to a real robot.
+  -->
+  <arg name="world_name" value="$(find patrollers)/worlds/area.world"/>    
+  <node name="stageros" pkg="stage_ros" type="stageros" args="$(arg world_name)" output="screen"/>
+  <arg name="use_sim_time" default="true"/>
+  <param name="use_sim_time" value="$(arg use_sim_time)"/>
+
+  <node name="security" pkg="patrollers" type="security" output="screen"/>
+
+  <node pkg="patrollers" type="overseer" name="overseer_0" output="screen" ns="robot_0">
+    <param name="location" type="int" value="0"/>
+  </node>
+  <node pkg="patrollers" type="overseer" name="overseer_1" output="screen" ns="robot_1">
+    <param name="location" type="int" value="1"/>
+  </node>
+  <node pkg="patrollers" type="overseer" name="overseer_2" output="screen" ns="robot_2">
+    <param name="location" type="int" value="2"/>
+  </node>
+  <node pkg="patrollers" type="overseer" name="overseer_3" output="screen" ns="robot_3">
+    <param name="location" type="int" value="3"/>
+  </node>
+</launch>

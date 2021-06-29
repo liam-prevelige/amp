@@ -1,0 +1,242 @@
+#!/usr/bin/env python
+
+from patrollers.dist import dist
+import math
+from patrollers.srv import ServiceRegistration, ServiceStopSimulation, ServiceStopSimulationResponse
+from patrollers.msg import TwoDimenArr
+import rospy
+from geometry_msgs.msg import Twist  # message type for cmd_vel
+from tf.transformations import euler_from_quaternion
+from sensor_msgs.msg import LaserScan  # message type for scan
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import PoseWithCovarianceStamped  # message type for passing positions to broadcaster
+from std_msgs.msg import String
+import patrollers.grid
+from patrollers.astar import a_star
+
+FREQUENCY = 10
+
+TURN_EPSILON = 1  # Acceptable error
+TURN_KP = 0.15  # Coefficient for turn speed
+FORWARD_KP = 0.1 # Coefficient for going forward
+INF = 99999  # Arbitrary large number
+FORWARD_EPSILON = 0.15
+LINEAR_VELOCITY = 0.5
+DEFAULT_REGISTER_TOPIC = "/register_overseer"
+DEFAULT_BEGIN_MOVEMENT_TOPIC = "/begin_movement"
+DEFAULT_VELOCITY_GRID_TOPIC = "/velocity_grid"
+DEFAULT_STOP_SIM_TOPIC = "stop_sim"
+
+DEFAULT_SCAN_TOPIC = 'base_scan'
+MAX_DISTANCE = 0.2  # margin for error for distance from a coordinate
+LASER_ANGLE_FRONT = 0  # radians
+MIN_THRESHOLD_DISTANCE = 0.1  # m, threshold distance.
+
+MAP_CORNERS = [[-12.25, 8.30], [12.25, 8.30], [12.25, -8.30], [-12.25, -8.30]]
+
+class Overseer:
+	def __init__(self, approach, start_location):
+		self.is_learned = False
+		if approach == "learned":
+			self.is_learned = True
+		self._close_obstacle = False
+		self.base_speed = 0.5
+		self.rate = rospy.Rate(FREQUENCY)
+
+		self.x = 0  # X coordinate of the robot
+		self.y = 0  # Y coordinate of the robot
+		self.yaw = 0  # Yaw of the robot
+
+		self.target_x = 0
+		self.target_y = 0
+		self.updated_position = False
+		self.current_corner = start_location
+		self.publish_positions = True
+		self.stop_simulation = False
+  
+		self._velocity_sub = rospy.Subscriber(DEFAULT_VELOCITY_GRID_TOPIC, TwoDimenArr, self._handle_velocity_grid)
+		self._begin_sub = rospy.Subscriber(DEFAULT_BEGIN_MOVEMENT_TOPIC, String, self._handle_begin_movement)
+
+		curr_pose_topic = str(rospy.get_namespace()) + "curr_pose"
+		self._position_pub = rospy.Publisher(curr_pose_topic, PoseWithCovarianceStamped, queue_size=1)
+		
+		self._odom_sub = rospy.Subscriber(rospy.get_namespace() + "base_pose_ground_truth", Odometry, self._odometry_callback, queue_size=1)
+		self._cmd_pub = rospy.Publisher(rospy.get_namespace() + "cmd_vel", Twist, queue_size=1)
+		scan_topic = str(rospy.get_namespace()) + DEFAULT_SCAN_TOPIC
+		self._laser_sub = rospy.Subscriber(scan_topic, LaserScan, self._laser_callback, queue_size=1)
+
+		rospy.Service(rospy.get_namespace() + DEFAULT_STOP_SIM_TOPIC, ServiceStopSimulation, self._handle_stop_simulation)
+		self.grid = patrollers.grid.Grid("/root/catkin_ws/src/patrollers/worlds/grid_data/double_field.grid")
+		self.register_bot()
+		rospy.sleep(2)
+
+		while not rospy.is_shutdown():
+			pass
+		
+
+	def register_bot(self):
+		"""Add bot name to the registry of auctioneer using service."""
+		rospy.wait_for_service(DEFAULT_REGISTER_TOPIC)
+		try:
+			registered_bot = rospy.ServiceProxy(DEFAULT_REGISTER_TOPIC, ServiceRegistration)
+			is_success = registered_bot(str(rospy.get_namespace()))
+			if not is_success.success:
+				rospy.sleep(1)
+				self.register_bot()
+		except rospy.ServiceException as e:
+			pass
+	
+	def _handle_begin_movement(self, msg):
+		"""Begin the patrollers movement and (re)start the simulation"""
+		received_msg = msg.data
+		if received_msg == "begin":
+			self.stop_simulation = True
+			rospy.sleep(1)
+			while not self.updated_position and not rospy.is_shutdown():
+				rospy.sleep(1)
+			self.stop_simulation = False
+			self.current_corner -= 1
+			self.patrol()
+	
+	def _handle_stop_simulation(self, msg):
+		"""Pause/stop the simulation upon request from security (i.e. confined detection/escape)"""
+		if msg.stopcommand == "stop":
+			self.stop_simulation = True
+			self.stop()
+			return ServiceStopSimulationResponse(True)
+		return ServiceStopSimulationResponse(False)
+   
+	def _handle_velocity_grid(self, msg):
+		"""Get custom message from security system for velocity values with occupancy grid"""
+		"""Converts 1d velocity grid into 2d according to message contents"""
+		if self.is_learned:
+			vg_onedimen = msg.items
+			vg_col_len = msg.rowLength
+
+			vg = list()
+			vg_col = list()
+			for i in range(len(vg_onedimen)):
+				vg_col.append(vg_onedimen[i])
+				if (i + 1) % vg_col_len == 0:
+					vg.append(vg_col)
+					vg_col = list()
+					
+			self.base_speed = patrollers.grid.get_velocity_at(vg, self.x, self.y)
+	
+	def turn(self, angle):
+		"""Function to turn by given angle."""
+		target_angle = angle * 180 / math.pi # Convert to degrees
+		while target_angle < 0 and not rospy.is_shutdown(): # Convert to positive
+			target_angle += 360
+		# While there's error
+		while (not rospy.is_shutdown() and not self.stop_simulation and (abs(target_angle - (self.yaw * 180 / math.pi))) > TURN_EPSILON):
+			twist_msg = Twist()
+			err = (target_angle - (self.yaw * 180 / math.pi))
+			if err > 180: # Turn from short way around
+				err = err - 360
+			elif err < -180: # Turn from short way around
+				err = 360 + err
+			twist_msg.angular.z = TURN_KP * err # Turn by the error
+			self._cmd_pub.publish(twist_msg)
+			rospy.sleep(0.2)
+
+	def move_forward(self, distance):
+		"""Function to move_forward for a given distance."""
+		initial_location = [self.x, self.y] # Store the initial location
+		# While the distance from the initial location is not large enough
+		while not rospy.is_shutdown() and not self.stop_simulation and abs(dist(initial_location, [self.x, self.y]) - distance) > FORWARD_EPSILON:
+			while self._close_obstacle: # If there's something in front of us
+				twist_msg = Twist() # Stop
+				twist_msg.angular.z = 1 # Turn
+				self._cmd_pub.publish(twist_msg)
+			twist_msg = Twist()
+			twist_msg.linear.x = FORWARD_KP * (distance - dist(initial_location, [self.x, self.y])) + self.base_speed
+			self._cmd_pub.publish(twist_msg)
+			rospy.sleep(0.2)
+		
+		twist_msg = Twist()
+		twist_msg.linear.x = 0 # Stop at the end
+		self._cmd_pub.publish(twist_msg)
+
+	def go_to_node(self, node):
+		"""Function to move to a node."""
+		angle_to_goal = math.atan2(patrollers.grid.get_node_y(node[0]) - self.y, patrollers.grid.get_node_x(node[1]) - self.x) # Calculate angle to the goal
+		self.turn(angle_to_goal) # Turn by that angle
+		distance_to_goal = dist([self.x, self.y], [patrollers.grid.get_node_x(node[1]), patrollers.grid.get_node_y(node[0])]) # Calculate distance
+		self.move_forward(distance_to_goal) # Go by the calculated distance
+
+	def _odometry_callback(self, msg):
+		"""Process positions and send updated position to the security system"""
+		self.x = msg.pose.pose.position.x # Update x
+		self.y = msg.pose.pose.position.y # Update y
+
+		global roll, pitch, yaw
+		orientation_q = msg.pose.pose.orientation
+		orientation_list = [orientation_q.x,orientation_q.y, orientation_q.z, orientation_q.w]
+		(roll, pitch, yaw) = euler_from_quaternion(orientation_list)
+		while yaw < 0 and not rospy.is_shutdown():
+			yaw += 2 * math.pi
+		self.yaw = yaw  # Update yaw
+		self.updated_position = True
+		self.send_position(msg)
+
+	def send_position(self, msg):
+		"""Send position to security"""
+		curr_pose = PoseWithCovarianceStamped()      # populated with position and orientation information for use by tf
+		curr_pose.header.stamp = rospy.get_rostime()
+		curr_pose.header.frame_id = str(rospy.get_namespace())
+		orientation_q = msg.pose.pose.orientation
+		curr_pose.pose.pose.position.x = msg.pose.pose.position.x
+		curr_pose.pose.pose.position.y = msg.pose.pose.position.y
+		curr_pose.pose.pose.position.z = msg.pose.pose.position.z
+		curr_pose.pose.pose.orientation.x = msg.pose.pose.orientation.x
+		curr_pose.pose.pose.orientation.y = msg.pose.pose.orientation.y
+		curr_pose.pose.pose.orientation.z = msg.pose.pose.orientation.z
+		curr_pose.pose.pose.orientation.w = msg.pose.pose.orientation.w
+		orientation_list = [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
+		self.curr_pose = curr_pose
+		self._position_pub.publish(curr_pose)
+	
+	def _laser_callback(self, msg):
+		"""Processing of laser message."""
+		# Access to the index of the measurement in front of the robot.
+		# NOTE: assumption: the one at angle 0 corresponds to the front.
+		i = int((LASER_ANGLE_FRONT - msg.angle_min) / msg.angle_increment)
+		if msg.ranges[i] <= MIN_THRESHOLD_DISTANCE:
+			self._close_obstacle = True
+		else:
+			self._close_obstacle = False
+
+	def find_shortest_path(self, location):
+		"""Find the shortest path to coordinate."""
+		return a_star(self.grid, 
+				(patrollers.grid.get_node_row(self.y), patrollers.grid.get_node_col(self.x)), 
+				(patrollers.grid.get_node_row(location[1]), patrollers.grid.get_node_col(location[0])))
+
+	def follow_path(self, path):
+		"""Follow the given path."""
+		for node in path:
+			if not self.stop_simulation:
+				self.go_to_node(node)
+
+	def patrol(self):
+		"""Patrol"""
+		while not rospy.is_shutdown() and not self.stop_simulation:
+			self.current_corner += 1
+			self.current_corner = self.current_corner % 4
+			self.follow_path(self.find_shortest_path(MAP_CORNERS[self.current_corner]))
+
+	def stop(self):
+		"""Stop the robot."""
+		twist_msg = Twist()
+		self._cmd_pub.publish(twist_msg)
+
+def main():
+	rospy.init_node("overseer")
+	rospy.sleep(2)
+
+	Overseer(rospy.get_param('~approach'), rospy.get_param('~location'))
+
+
+if __name__ == '__main__':
+	main()

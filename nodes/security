@@ -1,0 +1,447 @@
+#!/usr/bin/env python
+# The line above is important so that this file is interpreted with Python when running it.
+
+# Import of python modules.
+import math  # use of pi.
+import patrollers.grid  # used for pathfinding and velocity 
+from patrollers.dist import dist    # distance formula
+
+# message types for handling interactions between overseer and confined
+from patrollers.srv import ServiceRegistration, ServiceRegistrationResponse, ServiceStopSimulation, ServiceEscapedBot, ServiceEscapedBotResponse, ServiceSendBotCoords
+from patrollers.msg import TwoDimenArr
+from std_msgs.msg import String
+from geometry_msgs.msg import PoseWithCovarianceStamped
+import rospy
+import tf
+
+OVERSEER_REGISTER_TOPIC = "register_overseer"  # default topic searched for by overseer registration
+CONFINED_REGISTER_TOPIC = "register_confined"  # default topic searched for by confined registration
+CONFINED_ESCAPE_TOPIC = "confined_escaped"  # default topic searched for by bidder registration
+BEGIN_MOVEMENT_TOPIC = "begin_movement" # default topic for beginning simulation
+VELOCITY_GRID_TOPIC = "velocity_grid"   # default topic for sending velocity grid corresponding with map
+DEFAULT_STOP_SIM_TOPIC = "stop_sim" # default topic for stopping/pausing the simulation
+REQUEST_LOCATIONS_TOPIC = "request_bot_locations" # default topic for getting request from confined for all bot locations
+SEND_LOCATIONS_TOPIC = "send_bot_locations" # default topic for sending all bot locations
+CURR_POSE_TOPIC = "curr_pose" # default topic for getting all bots' current position
+
+# Numerical Constants
+NUM_CONFINED = 4
+MAX_DETECTION_DISTANCE = 4  # confined are detectable <= 4 meters from patroller
+MAX_DETECTION_ANGLE = 30  # confined are detectable +- 30 degrees from front
+START_VELOCITY = 0.5  # baseline and starting learned velocity
+MIN_VELOCITY = 0.2  # lower bound for learned implementation
+MAX_VELOCITY = 1.2  # upper bound for learned implementation
+FREQUENCY = 10  # rospy
+MAX_SIM_TIME = 180.  # time, in seconds, for simulation to run
+IMPOSSIBLE_COORDINATE = -99999.  # used to notify that sending bot coordinates is over
+VELOCITY_INCREMENT = 1.2 # each time a bot is detected, +20% velocity in all other areas
+VELOCITY_DECREMENT = 0.8 # each time a bot is detected, -20% velocity in immediate and nearby area
+ERROR_MARGIN = 0.001  # account for rounding errors
+VEL_CHANGE_RADIUS = 12  # number of nodes to change in velocity grid
+
+# Constants for messages and topic paths
+RETURNED_MESSAGE = "returned"
+STOP_COMMAND = "stop"
+BEGIN_COMMAND = "begin"
+WALL_CHAR = 'W'  # in occupancy grid, wall is 'W'
+PATROLLER_CHAR = 'P' # in occupancy grid, patrolling area is 'P'
+
+class Security():
+    def __init__(self, num_overseers):
+        """Initialize overarching security system and start interactions with all confined and overseers"""
+        self.num_overseers = num_overseers
+        self.rate = rospy.Rate(FREQUENCY)
+
+        self.listener = tf.TransformListener()
+        self.bot_locs = dict()  # all bots current world locations
+        
+        # all bots that have registered
+        self.registered_bots = list()   
+        self.overseer_bots = list()
+        self.confined_bots = list()
+        
+        self.begin_simulation = True
+        self.simulation_running = True
+        self.num_escapes = 0
+        self.num_detected = 0
+		
+        self.grid = patrollers.grid.Grid("/root/catkin_ws/src/patrollers/worlds/grid_data/double_field.grid")
+        
+        # map grid coordinates to velocity values for learned implementation
+        self.create_velocity_map()
+        
+        # services to register with confined/overseers
+        rospy.Service(OVERSEER_REGISTER_TOPIC, ServiceRegistration, self._handle_overseer_registration_request)
+        rospy.Service(CONFINED_REGISTER_TOPIC, ServiceRegistration, self._handle_confined_registration_request)
+
+        # notification from escaped bot that it has reached destination
+        rospy.Service(CONFINED_ESCAPE_TOPIC, ServiceEscapedBot, self._handle_confined_escape)
+
+        # publisher for start/resuming of simulation
+        self._begin_pub = rospy.Publisher(BEGIN_MOVEMENT_TOPIC, String, queue_size=1)
+
+        # listen for requests for all robot coordinates
+        self._req_bot_locs_sub = rospy.Subscriber(REQUEST_LOCATIONS_TOPIC, String, self._handle_location_request, queue_size=1)
+
+        # initialize other necessary simulation variables
+        self.overseer_poses = dict()
+        self.confined_poses = dict()
+        self.recently_escaped = set()
+        self.recently_detected = set()
+        self.training_time = 0.
+        self.simulation_time = 0.
+        self.excluded_time = 0
+        self.prior_time = -1
+        self._velocity_pubs = list()
+
+        # create publisher for every patroller to send velocity grid
+        for i in range(self.num_overseers):
+            self._velocity_pubs.append(rospy.Publisher(VELOCITY_GRID_TOPIC, TwoDimenArr, queue_size=1))
+
+        rospy.sleep(2)
+        
+        while not rospy.is_shutdown():
+            # Before doing other actions, check if completely registered
+            if len(self.registered_bots) == self.num_overseers + NUM_CONFINED:
+                if self.begin_simulation:
+                    self._begin_pub.publish(BEGIN_COMMAND)
+                    self.begin_simulation = False
+                    for _velocity_pub in self._velocity_pubs:
+                        _velocity_pub.publish(self.get_velocity_msg())
+                    self.prior_time = rospy.get_time()
+            if not self.handle_runtime():
+                break
+            self.rate.sleep()
+
+    def handle_runtime(self):
+        """Handle the stop/resuming of simulation, ensuring sim time is maintained properly and bot movement
+        is paused upon detection"""
+        if not self.begin_simulation and self.simulation_running:
+            self.prior_time = rospy.get_time()
+            self.training_time = (float(rospy.get_time()) - self.excluded_time)
+            if int(self.training_time/MAX_SIM_TIME) != 0:
+                self.end_simulation()
+                return False
+            
+            for overseer, opose in self.overseer_poses.items():
+                for confined, cpose in self.confined_poses.items():
+                    if self.is_detected(overseer, confined, opose[0], opose[1], opose[2], cpose[1], cpose[2]):
+                        self.recently_detected.add(confined)
+                        self.num_detected += 1
+                        # Send all bots updates on the detection of confined, either stopping or, if caught, returning to initial pose
+                        for bot in self.registered_bots:
+                            if bot != confined:
+                                rospy.wait_for_service(bot + DEFAULT_STOP_SIM_TOPIC)
+                                try:
+                                    stop_bot = rospy.ServiceProxy(bot + DEFAULT_STOP_SIM_TOPIC, ServiceStopSimulation)
+                                    is_success = stop_bot(STOP_COMMAND)
+                                    if not is_success.success:
+                                        is_success = stop_bot(STOP_COMMAND)
+                                except rospy.ServiceException as e:
+                                    pass
+                            else:
+                                rospy.wait_for_service(bot + DEFAULT_STOP_SIM_TOPIC)
+                                try:
+                                    stop_bot = rospy.ServiceProxy(bot + DEFAULT_STOP_SIM_TOPIC, ServiceStopSimulation)
+                                    is_success = stop_bot(bot)
+                                    if not is_success.success:
+                                        is_success = stop_bot(bot)
+                                except rospy.ServiceException as e:
+                                    pass
+                        self.simulation_running = False
+        else:
+            if self.prior_time == -1:
+                self.prior_time = rospy.get_time()
+            self.excluded_time += float(rospy.get_time())-self.prior_time
+            self.prior_time = rospy.get_time()
+        return True
+
+    def end_simulation(self):
+        """Simulation has ended, notify user of meta data"""
+        print("NUM DETECTED: " + str(self.num_detected))
+        print("NUM ESCAPED: " + str(self.num_escapes))
+        for bot in self.registered_bots:
+            rospy.wait_for_service(bot + DEFAULT_STOP_SIM_TOPIC)
+            try:
+                stop_bot = rospy.ServiceProxy(bot + DEFAULT_STOP_SIM_TOPIC, ServiceStopSimulation)
+                is_success = stop_bot(STOP_COMMAND)
+                if not is_success.success:
+                    is_success = stop_bot(STOP_COMMAND)
+            except rospy.ServiceException as e:
+                pass
+
+    def _handle_overseer_registration_request(self, request):
+        """Callback for subscriber handling overseer regisration"""
+        if len(str(request.robotname)) > 0:
+            rospy.Subscriber(str(request.robotname) + CURR_POSE_TOPIC, PoseWithCovarianceStamped, self._handle_overseer_pose, queue_size=1)
+            rospy.sleep(2)
+            self.registered_bots.append(request.robotname)
+            self.overseer_bots.append(request.robotname)
+
+            # service allows bidder to keep sending until success
+            return ServiceRegistrationResponse(True)
+        return ServiceRegistrationResponse(False)
+    
+    def _handle_confined_registration_request(self, request):
+        """Callback for subscriber handling confined robot regisration"""
+        if len(str(request.robotname)) > 0:
+            rospy.Subscriber(str(request.robotname) + CURR_POSE_TOPIC, PoseWithCovarianceStamped, self._handle_confined_pose, queue_size=1)
+            rospy.sleep(2)
+
+            self.registered_bots.append(request.robotname)
+            self.confined_bots.append(request.robotname)
+
+            # service allows bidder to keep sending until success
+            return ServiceRegistrationResponse(True)
+        return ServiceRegistrationResponse(False)
+    
+    def _handle_overseer_pose(self, msg):
+        """Callback for getting overseer position"""
+        bot_header = msg._connection_header["topic"]
+        bot_name = bot_header[:bot_header[1:].index("/")+2]
+        self.overseer_poses[bot_name] = self.get_positional_array(msg)
+    
+    def _handle_confined_pose(self, msg):
+        """Callback for getting confined position"""
+        bot_header = msg._connection_header["topic"]
+        bot_name = bot_header[:bot_header[1:].index("/")+2]
+        self.confined_poses[bot_name] = self.get_positional_array(msg)
+    
+    def _handle_confined_escape(self, msg):
+        """Callback for handling confined robot's notification of succcessful escape/return following escape"""
+
+        # update[1] contains information about whether caught/returning
+        update = msg.escaped.split("|")
+
+        # if not in recently escaped and not returning, then it must be a new escape!
+        if update[0] not in self.recently_escaped and update[1] != RETURNED_MESSAGE:
+            self.recently_escaped.add(update[0])
+            self.num_escapes += 1
+            for bot in self.registered_bots:
+                rospy.wait_for_service(bot + DEFAULT_STOP_SIM_TOPIC)
+                try:
+                    stop_bot = rospy.ServiceProxy(bot + DEFAULT_STOP_SIM_TOPIC, ServiceStopSimulation)
+                    is_success = stop_bot(STOP_COMMAND)
+                    if not is_success.success:
+                        is_success = stop_bot(STOP_COMMAND)
+                except rospy.ServiceException as e:
+                    pass
+            self._begin_pub.publish(STOP_COMMAND)
+            self.simulation_running = False
+            return ServiceEscapedBotResponse(True)
+        # otherwise returning following the successful escape, update lists accordingly
+        elif update[1] == RETURNED_MESSAGE:
+            if update[0] in self.recently_escaped:
+                self.recently_escaped.remove(update[0])
+            if update[0]in self.recently_detected:
+                self.recently_detected.remove(update[0])
+            self._begin_pub.publish(BEGIN_COMMAND)
+            rospy.sleep(1)
+            self.simulation_running = True
+            return ServiceEscapedBotResponse(True)
+
+    def _handle_location_request(self, msg):
+        """Used to send all coordinates of bots to prevent from collision during simulation reset"""
+        # send patroller locations
+        for patroller_location in self.overseer_poses.values():
+            rospy.wait_for_service(msg.data + SEND_LOCATIONS_TOPIC)
+            try:
+                send_coord = rospy.ServiceProxy(msg.data + SEND_LOCATIONS_TOPIC, ServiceSendBotCoords)
+                is_success = send_coord([patroller_location[1], patroller_location[2]])
+                if not is_success.success:
+                    is_success = send_coord([patroller_location[1], patroller_location[2]])
+            except rospy.ServiceException as e:
+                pass
+        # send confined locations
+        for bot_name, confined_location in self.confined_poses.items():
+            if bot_name != msg.data:
+                rospy.wait_for_service(msg.data + SEND_LOCATIONS_TOPIC)
+                try:
+                    send_coord = rospy.ServiceProxy(msg.data + SEND_LOCATIONS_TOPIC, ServiceSendBotCoords)
+                    is_success = send_coord([confined_location[1], confined_location[2]])
+                    if not is_success.success:
+                        is_success = send_coord([confined_location[1], confined_location[2]])
+                except rospy.ServiceException as e:
+                    pass
+        rospy.wait_for_service(msg.data + SEND_LOCATIONS_TOPIC)
+        try:
+            send_coord = rospy.ServiceProxy(msg.data + SEND_LOCATIONS_TOPIC, ServiceSendBotCoords)
+            is_success = send_coord([IMPOSSIBLE_COORDINATE, IMPOSSIBLE_COORDINATE])
+            if not is_success.success:
+                is_success = send_coord([IMPOSSIBLE_COORDINATE, IMPOSSIBLE_COORDINATE])
+        except rospy.ServiceException as e:
+            pass
+
+    def get_positional_array(self, pose_msg):
+        """Convert odom message information into consistent formatted array"""
+        orientation_q = pose_msg.pose.pose.orientation
+        
+        mx = pose_msg.pose.pose.position.x
+        my = pose_msg.pose.pose.position.y
+        
+        orientation_list = [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
+        (roll, pitch, yaw) = tf.transformations.euler_from_quaternion(orientation_list)
+        yaw = yaw*180/math.pi
+        while yaw < 0 and not rospy.is_shutdown():
+            yaw += 360
+      
+        return [yaw, mx, my]
+
+    def create_velocity_map(self):
+        """Iterate over characters of adjacency grid, initializing into corresponding velocity values"""
+        num_rows = self.grid.get_num_rows()
+        num_cols = self.grid.get_num_columns()
+        
+        self.velocity_map = [[0 for i in range(num_cols)] for x in range(num_rows)]
+        for r in range(num_rows):
+            for c in range(num_cols):
+                if self.grid.get_grid_value(r,c) == PATROLLER_CHAR:
+                    self.velocity_map[r][c] = START_VELOCITY
+    
+    def get_velocity_msg(self):
+        """Turn velocity map into 1d array and add to custom message type"""
+        velocityOneDimen = list()
+        
+        for ri in range(len(self.velocity_map)):
+            for ci in range(len(self.velocity_map[0])):
+                velocityOneDimen.append(self.velocity_map[ri][ci])
+        
+        return TwoDimenArr(velocityOneDimen, len(self.velocity_map[0]))
+    
+    def is_detected(self, opose, confined, p_yaw, p_x, p_y, c_x, c_y):
+        """Determine whether a confined robot is visible to a patroller"""
+        if dist([p_x, p_y], [c_x, c_y]) > MAX_DETECTION_DISTANCE:
+            return False
+        
+        if (self.grid.get_grid_value(patrollers.grid.get_node_row(c_y), patrollers.grid.get_node_col(c_x)) == 'C'):
+            return False
+        
+        # Process angle to current confined robot 
+        target_angle = math.atan2(p_y-c_y, p_x-c_x)*180/math.pi
+        target_angle += 180
+        while target_angle < 0 and not rospy.is_shutdown():
+            target_angle += 360
+        target_angle = target_angle%360
+
+        # To be safe, set smaller angle as angle1 for consistency in angle calculations  
+        if target_angle < p_yaw:
+            angle1 = target_angle
+            angle2 = p_yaw
+        else:
+            angle2 = target_angle
+            angle1 = p_yaw
+        
+        # Patroller must be facing confined
+        if abs(angle1 - angle2) > MAX_DETECTION_ANGLE and angle1 - angle2 > MAX_DETECTION_ANGLE-360:
+            return False
+        
+        start_x, start_y, end_x, end_y, xinc, yinc = self.get_detection_start_params(p_x, p_y, c_x, c_y)
+        
+        curr_y = start_y
+        prior_y = start_y
+        curr_x = start_x + xinc
+        
+        # Iterate over a 'line' between the confined and overseer
+        while not rospy.is_shutdown() and curr_y - end_y > ERROR_MARGIN:
+            curr_y += yinc
+            
+            # Check for 'horizontal' intersection with wall
+            if self.grid.get_grid_value(int(curr_y), int(curr_x)) == WALL_CHAR:
+                if self.grid.get_grid_value(int(curr_y) + 1, int(curr_x)) == WALL_CHAR:
+                    if not curr_y-end_y < ERROR_MARGIN or curr_x != end_x:
+                        return False
+            else:
+                if not curr_y-end_y < ERROR_MARGIN or curr_x != end_x:
+                    return False
+            
+            # Check for 'vertical' intersection with wall
+            row_diff = int(prior_y) - int(curr_y)
+            for i in range(1, row_diff+1):
+                if self.grid.get_grid_value(int(curr_y)+i, int(curr_x)) == WALL_CHAR:
+                    if self.grid.get_grid_value(int(curr_y)+i, int(curr_x + 1)) == WALL_CHAR:
+                        reached_y_dest = (int(curr_y) + i) - end_y < ERROR_MARGIN
+                        if (not reached_y_dest or curr_x != curr_y) and (int(curr_y) + i != start_y and curr_x != start_x):
+                            return False
+
+            if curr_y - end_y < ERROR_MARGIN and curr_x == end_x:
+                return True
+
+            self.rate.sleep()
+
+            prior_y = curr_y
+            curr_x += xinc
+            
+        self.update_velocity_grid(p_x, p_y)
+        return True
+        
+    def get_detection_start_params(self, p_x, p_y, c_x, c_y):
+        """Initializing relevant information for process of determining visibility"""
+        px = patrollers.grid.get_node_col(p_x)
+        py = patrollers.grid.get_node_row(p_y)
+        cx = patrollers.grid.get_node_col(c_x)
+        cy = patrollers.grid.get_node_row(c_y)
+        
+        start_x = px
+        start_y = py
+        end_x = cx
+        end_y = cy
+        
+        if py < cy:
+            start_x = cx
+            start_y = cy
+            end_x = px
+            end_y = py
+        
+        yinc = 0.
+        if start_x - end_x != 0:
+            num = float(abs(start_y-end_y))
+            denom = float(abs(start_x-end_x))
+            yinc = -1. * num/denom
+            if start_x > end_x:
+                xinc = -1.0
+            else:
+                xinc = 1.
+        else:
+            xinc = 0.
+            yinc = -1.
+        
+        return start_x, start_y, end_x, end_y, xinc, yinc
+
+    def update_velocity_grid(self, p_x, p_y):
+        """Upon confined detection, update immediate region with velocity changes"""
+        col = patrollers.grid.get_node_col(p_x)
+        row = patrollers.grid.get_node_row(p_y)
+        
+        # Speed up robots in areas where patroller didn't discover confined
+        for r in range(row-VEL_CHANGE_RADIUS, row+VEL_CHANGE_RADIUS+1):
+            for c in range(col-VEL_CHANGE_RADIUS, col+VEL_CHANGE_RADIUS+1):
+                if r < len(self.velocity_map) and c < len(self.velocity_map[0]):
+                    self.velocity_map[r][c] = self.velocity_map[r][c]*VELOCITY_DECREMENT
+                    if self.velocity_map[r][c] > MIN_VELOCITY:
+                        self.velocity_map[r][c] = MIN_VELOCITY
+        # Slow down up robots in areas where patroller did discover confined
+        for r in range(len(self.velocity_map[0])):
+            for c in range(len(self.velocity_map)):
+                if r < len(self.velocity_map) and c < len(self.velocity_map[0]):
+                    self.velocity_map[r][c] = self.velocity_map[r][c]*VELOCITY_INCREMENT
+                    if self.velocity_map[r][c] > MAX_VELOCITY:
+                        self.velocity_map[r][c] = MAX_VELOCITY
+        
+        for _velocity_pub in self._velocity_pubs:
+            _velocity_pub.publish(self.get_velocity_msg())
+
+def main():
+    """Main function."""
+    # 1st. initialization of node.
+    rospy.init_node("security")
+
+    # Sleep for a few seconds to wait for the registration.
+    rospy.sleep(2)
+
+    # Initialization of the class
+    Security(rospy.get_param('~num_overseers'))
+
+
+if __name__ == "__main__":
+    """Run the main function."""
+    main()
