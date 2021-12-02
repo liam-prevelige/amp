@@ -1,8 +1,8 @@
-# Intelligent and Decentralized Multi-Robot Patrol System
+# Intelligent Multi-Robot Patrol System
 > Liam Prevelige - Eren Aldemir\
 > Dartmouth College
 
-This ROS package contains the code for final project.
+This ROS package contains the code for an intelligent multirobot patrol system using the ROS framework.
 
 ## Requirements
 - ROS -- tested on Melodic, but other versions may work.
