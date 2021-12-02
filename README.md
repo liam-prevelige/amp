@@ -1,8 +1,6 @@
 # Intelligent and Decentralized Multi-Robot Patrol System
-> Dartmouth College\
-> Spring 2021\
-> COSC69.13\
-> Liam Prevelige - Eren Aldemir
+> Liam Prevelige - Eren Aldemir\
+> Dartmouth College
 
 This ROS package contains the code for final project.
 
